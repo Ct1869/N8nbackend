@@ -8,20 +8,17 @@ const app = express();
 /* ------------------------- Middleware ------------------------- */
 app.use(express.json());
 
-// Configure CORS: allow your frontend and optionally others via env var
+// Configure CORS
 const DEFAULT_ALLOWED_ORIGINS = [
-  "https://kingof-gray.vercel.app",     // your frontend
-  "https://kingo-fbackend.vercel.app"   // your backend (optional, for self-calls)
+  "https://kingof-gray.vercel.app",     // frontend
+  "https://kingo-fbackend.vercel.app"   // backend (optional)
 ];
-
 const allowedOrigins = (process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean)
   : DEFAULT_ALLOWED_ORIGINS
 );
-
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow non-browser clients (curl, server-to-server) with no Origin
     if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
@@ -31,33 +28,22 @@ app.use(cors({
 
 /* ---------------------- MongoDB connection -------------------- */
 const MONGODB_URI = process.env.MONGODB_URI;
-
 if (!MONGODB_URI) {
-  console.error("❌ MONGODB_URI is not set. Add it in your Vercel project → Settings → Environment Variables.");
-  // Exit early in non-serverless env to avoid hanging
+  console.error("❌ MONGODB_URI is not set");
   if (require.main === module) process.exit(1);
 }
-
-// Connect (Mongoose queues operations until connected)
 if (MONGODB_URI) {
-  mongoose
-    .connect(MONGODB_URI, { autoIndex: true })
-    .catch(err => {
-      console.error("❌ Initial MongoDB connection error:", err);
-      if (require.main === module) process.exit(1);
-    });
+  mongoose.connect(MONGODB_URI, { autoIndex: true }).catch(err => {
+    console.error("❌ Initial MongoDB connection error:", err);
+    if (require.main === module) process.exit(1);
+  });
 }
 
 /* --------------------- Schema & Model ------------------------- */
-const phoneSchema = new mongoose.Schema(
-  {
-    number: { type: String, required: true, unique: true },
-    mode: { type: String, enum: ["CALL", "OTP"], default: "CALL" },
-  },
-  {
-    timestamps: true, // createdAt / updatedAt
-  }
-);
+const phoneSchema = new mongoose.Schema({
+  number: { type: String, required: true, unique: true },
+  mode: { type: String, enum: ["CALL", "OTP"], default: "CALL" },
+}, { timestamps: true });
 
 const PhoneMode = mongoose.model("PhoneMode", phoneSchema);
 
@@ -69,9 +55,8 @@ const seedNumbers = [
   { number: "+15088127382", mode: "CALL" },
   { number: "+18722965039", mode: "CALL" },
   { number: "+14172218933", mode: "CALL" },
-  { number: "+19191919191", mode: "OTP" }, // your custom OTP number
+  { number: "+19191919191", mode: "OTP" }
 ];
-
 async function seedDB() {
   try {
     for (const num of seedNumbers) {
@@ -81,70 +66,36 @@ async function seedDB() {
         { upsert: true }
       );
     }
-    console.log("✅ Numbers initialized in database");
+    console.log("✅ Numbers initialized");
   } catch (err) {
     console.error("❌ Error seeding DB:", err);
   }
 }
-
-// Seed after a successful DB connection
-mongoose.connection.on("connected", () => {
-  console.log("✅ MongoDB connected successfully");
-  seedDB();
-});
-mongoose.connection.on("error", (err) => {
-  console.error("❌ MongoDB connection error:", err);
-});
-mongoose.connection.on("disconnected", () => {
-  console.log("⚠️ MongoDB disconnected");
-});
+mongoose.connection.on("connected", () => { console.log("✅ MongoDB connected"); seedDB(); });
+mongoose.connection.on("error", err => console.error("❌ MongoDB error:", err));
+mongoose.connection.on("disconnected", () => console.log("⚠️ MongoDB disconnected"));
 
 /* ------------------------- Helpers ---------------------------- */
-function normalize(num) {
-  return (num || "").toString().trim();
-}
+const normalize = num => (num || "").toString().trim();
 
 /* ----------------------- API Endpoints ------------------------ */
+app.get("/", (req, res) => res.json({ ok: true, service: "phone-manager-api", time: new Date().toISOString() }));
 
-// Simple root for sanity check
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "phone-manager-api", time: new Date().toISOString() });
-});
-
-// Health check endpoint
 app.get("/health", async (req, res) => {
   try {
-    // This will throw if not connected
     await mongoose.connection.db.admin().ping();
-    res.json({
-      status: "healthy",
-      database: "connected",
-      timestamp: new Date().toISOString(),
-    });
+    res.json({ status: "healthy", database: "connected", timestamp: new Date().toISOString() });
   } catch (err) {
-    console.error("❌ Health check failed:", err);
-    res.status(500).json({
-      status: "unhealthy",
-      database: "disconnected",
-      error: err.message,
-      timestamp: new Date().toISOString(),
-    });
+    res.status(500).json({ status: "unhealthy", database: "disconnected", error: err.message, timestamp: new Date().toISOString() });
   }
 });
 
-// Original lookup endpoint (single number)
 app.post("/lookup", async (req, res) => {
   try {
     const rawCalled = req.body.Called || req.query.Called;
     const rawTo = req.body.To || req.query.To;
     const calledNumber = normalize(rawCalled || rawTo);
-
-    console.log("DEBUG raw Called:", rawCalled);
-    console.log("DEBUG raw To:", rawTo);
-    console.log("DEBUG normalized calledNumber:", calledNumber);
-
     const found = await PhoneMode.findOne({ number: calledNumber });
-
     res.json({
       calledNumber,
       mode: found ? found.mode : "UNKNOWN",
@@ -152,169 +103,103 @@ app.post("/lookup", async (req, res) => {
       callSid: req.body.CallSid || req.query.CallSid,
     });
   } catch (err) {
-    console.error("❌ Error in lookup:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Get all numbers in database
 app.get("/numbers", async (req, res) => {
   try {
     const allNumbers = await PhoneMode.find().sort({ createdAt: -1 });
     res.json(allNumbers);
-  } catch (err) {
-    console.error("❌ Error fetching numbers:", err);
+  } catch {
     res.status(500).json({ error: "Failed to fetch numbers" });
   }
 });
 
-// Add new number endpoint
 app.post("/add-number", async (req, res) => {
   try {
     const { number, mode } = req.body;
-
-    if (!number || !mode) {
-      return res.status(400).json({ error: "Number and mode are required" });
-    }
-
+    if (!number || !mode) return res.status(400).json({ error: "Number and mode are required" });
     const normalizedNumber = normalize(number);
-
-    if (!normalizedNumber) {
-      return res.status(400).json({ error: "Invalid number format" });
-    }
-
-    if (!["CALL", "OTP"].includes(mode)) {
-      return res.status(400).json({ error: "Mode must be CALL or OTP" });
-    }
-
-    const existing = await PhoneMode.findOne({ number: normalizedNumber });
-    if (existing) {
-      return res.status(400).json({ error: "Number already exists" });
-    }
-
-    const newNumber = new PhoneMode({
-      number: normalizedNumber,
-      mode,
-    });
-
-    const saved = await newNumber.save();
-
-    console.log("✅ Number added:", saved.number, "Mode:", saved.mode);
-
-    res.json({
-      success: true,
-      message: "Number added successfully",
-      data: saved,
-    });
+    if (!["CALL", "OTP"].includes(mode)) return res.status(400).json({ error: "Mode must be CALL or OTP" });
+    if (await PhoneMode.findOne({ number: normalizedNumber })) return res.status(400).json({ error: "Number already exists" });
+    const saved = await new PhoneMode({ number: normalizedNumber, mode }).save();
+    res.json({ success: true, data: saved });
   } catch (err) {
-    console.error("❌ Error adding number:", err);
-
-    if (err.code === 11000) {
-      return res.status(400).json({ error: "Number already exists" });
-    }
-
     res.status(500).json({ error: "Failed to add number" });
   }
 });
 
-// Update mode endpoint
 app.put("/update-mode", async (req, res) => {
   try {
     const { id, mode } = req.body;
-
-    if (!id || !mode) {
-      return res.status(400).json({ error: "ID and mode are required" });
-    }
-
-    if (!["CALL", "OTP"].includes(mode)) {
-      return res.status(400).json({ error: "Mode must be CALL or OTP" });
-    }
-
-    const updated = await PhoneMode.findByIdAndUpdate(
-      id,
-      { mode },
-      { new: true }
-    );
-
-    if (!updated) {
-      return res.status(404).json({ error: "Number not found" });
-    }
-
-    console.log("✅ Mode updated:", updated.number, "New mode:", updated.mode);
-
-    res.json({
-      success: true,
-      message: "Mode updated successfully",
-      data: updated,
-    });
-  } catch (err) {
-    console.error("❌ Error updating mode:", err);
+    if (!id || !mode) return res.status(400).json({ error: "ID and mode are required" });
+    if (!["CALL", "OTP"].includes(mode)) return res.status(400).json({ error: "Mode must be CALL or OTP" });
+    const updated = await PhoneMode.findByIdAndUpdate(id, { mode }, { new: true });
+    if (!updated) return res.status(404).json({ error: "Number not found" });
+    res.json({ success: true, data: updated });
+  } catch {
     res.status(500).json({ error: "Failed to update mode" });
   }
 });
 
-// Delete number endpoint
 app.delete("/delete-number/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({ error: "ID is required" });
-    }
-
-    const deleted = await PhoneMode.findByIdAndDelete(id);
-
-    if (!deleted) {
-      return res.status(404).json({ error: "Number not found" });
-    }
-
-    console.log("✅ Number deleted:", deleted.number);
-
-    res.json({
-      success: true,
-      message: "Number deleted successfully",
-      data: deleted,
-    });
-  } catch (err) {
-    console.error("❌ Error deleting number:", err);
+    const deleted = await PhoneMode.findByIdAndDelete(req.params.id);
+    if (!deleted) return res.status(404).json({ error: "Number not found" });
+    res.json({ success: true, data: deleted });
+  } catch {
     res.status(500).json({ error: "Failed to delete number" });
   }
 });
 
-// Get statistics endpoint
 app.get("/stats", async (req, res) => {
   try {
     const total = await PhoneMode.countDocuments();
     const callCount = await PhoneMode.countDocuments({ mode: "CALL" });
     const otpCount = await PhoneMode.countDocuments({ mode: "OTP" });
-
-    res.json({
-      total,
-      call: callCount,
-      otp: otpCount,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("❌ Error fetching stats:", err);
-    res.status(500).json({ error: "Failed to fetch statistics" });
+    res.json({ total, call: callCount, otp: otpCount, timestamp: new Date().toISOString() });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch stats" });
   }
 });
 
-// Bulk add numbers endpoint
 app.post("/bulk-add", async (req, res) => {
   try {
     const { numbers } = req.body;
-
-    if (!Array.isArray(numbers) || numbers.length === 0) {
-      return res.status(400).json({ error: "Numbers array is required" });
-    }
-
-    const results = {
-      added: [],
-      errors: [],
-      skipped: [],
-    };
-
+    if (!Array.isArray(numbers)) return res.status(400).json({ error: "Numbers array required" });
+    const results = { added: [], errors: [], skipped: [] };
     for (const item of numbers) {
       try {
-        const { nu
+        const normalizedNumber = normalize(item.number);
+        if (!normalizedNumber) { results.errors.push({ number: item.number, error: "Invalid" }); continue; }
+        if (!["CALL", "OTP"].includes(item.mode)) { results.errors.push({ number: item.number, error: "Invalid mode" }); continue; }
+        if (await PhoneMode.findOne({ number: normalizedNumber })) { results.skipped.push({ number: normalizedNumber, reason: "Exists" }); continue; }
+        const saved = await new PhoneMode({ number: normalizedNumber, mode: item.mode || "CALL" }).save();
+        results.added.push(saved);
+      } catch (err) { results.errors.push({ number: item.number, error: err.message }); }
+    }
+    res.json({ success: true, results });
+  } catch {
+    res.status(500).json({ error: "Bulk add failed" });
+  }
+});
+
+/* -------------------- Global error handler -------------------- */
+app.use((err, req, res, next) => {
+  console.error("❌ Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+/* --------------------- Graceful shutdown ---------------------- */
+process.on("SIGINT", async () => {
+  console.log("⚠️ SIGINT received, closing DB...");
+  try { await mongoose.connection.close(); } finally { process.exit(0); }
+});
+
+/* --------------- Export for Vercel / Local run ---------------- */
+module.exports = app;
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`🚀 Local server at http://localhost:${PORT}`));
+}
