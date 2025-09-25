@@ -10,7 +10,7 @@ app.use(cors());
 
 // MongoDB connection
 mongoose.connect(
-  "mongodb+srv://jmc_db_user:qLfR7JDrc3I2cFye@cluster0.phone-manager.mongodb.net/?retryWrites=true&w=majority&appName=n8n"
+  "mongodb+srv://jmc_db_user:<db_password>@phone-manager.rqeyqhc.mongodb.net/?retryWrites=true&w=majority&appName=phone-manager"
 );
 
 // Schema & Model
