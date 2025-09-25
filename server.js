@@ -30,14 +30,64 @@ app.use(cors({
 const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
   console.error("❌ MONGODB_URI is not set");
-  if (require.main === module) process.exit(1);
 }
-if (MONGODB_URI) {
-  mongoose.connect(MONGODB_URI, { autoIndex: true }).catch(err => {
-    console.error("❌ Initial MongoDB connection error:", err);
-    if (require.main === module) process.exit(1);
-  });
+
+// Global connection variable to cache the connection
+let cachedConnection = null;
+
+async function connectToDatabase() {
+  if (cachedConnection && mongoose.connection.readyState === 1) {
+    console.log("✅ Using cached MongoDB connection");
+    return cachedConnection;
+  }
+
+  if (!MONGODB_URI) {
+    throw new Error("MONGODB_URI is not defined");
+  }
+
+  try {
+    console.log("🔄 Creating new MongoDB connection...");
+    
+    // Set mongoose connection options for serverless
+    mongoose.set('bufferCommands', false);
+    mongoose.set('maxPoolSize', 10);
+    mongoose.set('serverSelectionTimeoutMS', 5000);
+    mongoose.set('socketTimeoutMS', 45000);
+    mongoose.set('bufferMaxEntries', 0);
+    
+    const connection = await mongoose.connect(MONGODB_URI, {
+      autoIndex: true,
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      bufferCommands: false,
+      bufferMaxEntries: 0,
+    });
+
+    cachedConnection = connection;
+    console.log("✅ MongoDB connected successfully");
+    
+    // Seed database after connection
+    await seedDB();
+    
+    return connection;
+  } catch (error) {
+    console.error("❌ MongoDB connection error:", error);
+    cachedConnection = null;
+    throw error;
+  }
 }
+
+// Connection event handlers
+mongoose.connection.on("error", (err) => {
+  console.error("❌ MongoDB error:", err);
+  cachedConnection = null;
+});
+
+mongoose.connection.on("disconnected", () => {
+  console.log("⚠️ MongoDB disconnected");
+  cachedConnection = null;
+});
 
 /* --------------------- Schema & Model ------------------------- */
 const phoneSchema = new mongoose.Schema({
@@ -57,6 +107,7 @@ const seedNumbers = [
   { number: "+14172218933", mode: "CALL" },
   { number: "+19191919191", mode: "OTP" }
 ];
+
 async function seedDB() {
   try {
     for (const num of seedNumbers) {
@@ -71,26 +122,57 @@ async function seedDB() {
     console.error("❌ Error seeding DB:", err);
   }
 }
-mongoose.connection.on("connected", () => { console.log("✅ MongoDB connected"); seedDB(); });
-mongoose.connection.on("error", err => console.error("❌ MongoDB error:", err));
-mongoose.connection.on("disconnected", () => console.log("⚠️ MongoDB disconnected"));
 
 /* ------------------------- Helpers ---------------------------- */
 const normalize = num => (num || "").toString().trim();
 
+// Middleware to ensure database connection
+async function ensureDbConnection(req, res, next) {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    console.error("❌ Database connection failed:", error);
+    res.status(500).json({ 
+      error: "Database connection failed", 
+      timestamp: new Date().toISOString() 
+    });
+  }
+}
+
 /* ----------------------- API Endpoints ------------------------ */
-app.get("/", (req, res) => res.json({ ok: true, service: "phone-manager-api", time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ 
+  ok: true, 
+  service: "phone-manager-api", 
+  time: new Date().toISOString() 
+}));
 
 app.get("/health", async (req, res) => {
   try {
+    await connectToDatabase();
+    
+    // Test the connection with a simple operation
     await mongoose.connection.db.admin().ping();
-    res.json({ status: "healthy", database: "connected", timestamp: new Date().toISOString() });
+    
+    res.json({ 
+      status: "healthy", 
+      database: "connected", 
+      connectionState: mongoose.connection.readyState,
+      timestamp: new Date().toISOString() 
+    });
   } catch (err) {
-    res.status(500).json({ status: "unhealthy", database: "disconnected", error: err.message, timestamp: new Date().toISOString() });
+    console.error("❌ Health check failed:", err);
+    res.status(500).json({ 
+      status: "unhealthy", 
+      database: "disconnected", 
+      error: err.message, 
+      connectionState: mongoose.connection.readyState,
+      timestamp: new Date().toISOString() 
+    });
   }
 });
 
-app.post("/lookup", async (req, res) => {
+app.post("/lookup", ensureDbConnection, async (req, res) => {
   try {
     const rawCalled = req.body.Called || req.query.Called;
     const rawTo = req.body.To || req.query.To;
@@ -103,20 +185,22 @@ app.post("/lookup", async (req, res) => {
       callSid: req.body.CallSid || req.query.CallSid,
     });
   } catch (err) {
+    console.error("❌ Lookup error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.get("/numbers", async (req, res) => {
+app.get("/numbers", ensureDbConnection, async (req, res) => {
   try {
     const allNumbers = await PhoneMode.find().sort({ createdAt: -1 });
     res.json(allNumbers);
-  } catch {
+  } catch (err) {
+    console.error("❌ Fetch numbers error:", err);
     res.status(500).json({ error: "Failed to fetch numbers" });
   }
 });
 
-app.post("/add-number", async (req, res) => {
+app.post("/add-number", ensureDbConnection, async (req, res) => {
   try {
     const { number, mode } = req.body;
     if (!number || !mode) return res.status(400).json({ error: "Number and mode are required" });
@@ -126,11 +210,12 @@ app.post("/add-number", async (req, res) => {
     const saved = await new PhoneMode({ number: normalizedNumber, mode }).save();
     res.json({ success: true, data: saved });
   } catch (err) {
+    console.error("❌ Add number error:", err);
     res.status(500).json({ error: "Failed to add number" });
   }
 });
 
-app.put("/update-mode", async (req, res) => {
+app.put("/update-mode", ensureDbConnection, async (req, res) => {
   try {
     const { id, mode } = req.body;
     if (!id || !mode) return res.status(400).json({ error: "ID and mode are required" });
@@ -138,33 +223,36 @@ app.put("/update-mode", async (req, res) => {
     const updated = await PhoneMode.findByIdAndUpdate(id, { mode }, { new: true });
     if (!updated) return res.status(404).json({ error: "Number not found" });
     res.json({ success: true, data: updated });
-  } catch {
+  } catch (err) {
+    console.error("❌ Update mode error:", err);
     res.status(500).json({ error: "Failed to update mode" });
   }
 });
 
-app.delete("/delete-number/:id", async (req, res) => {
+app.delete("/delete-number/:id", ensureDbConnection, async (req, res) => {
   try {
     const deleted = await PhoneMode.findByIdAndDelete(req.params.id);
     if (!deleted) return res.status(404).json({ error: "Number not found" });
     res.json({ success: true, data: deleted });
-  } catch {
+  } catch (err) {
+    console.error("❌ Delete number error:", err);
     res.status(500).json({ error: "Failed to delete number" });
   }
 });
 
-app.get("/stats", async (req, res) => {
+app.get("/stats", ensureDbConnection, async (req, res) => {
   try {
     const total = await PhoneMode.countDocuments();
     const callCount = await PhoneMode.countDocuments({ mode: "CALL" });
     const otpCount = await PhoneMode.countDocuments({ mode: "OTP" });
     res.json({ total, call: callCount, otp: otpCount, timestamp: new Date().toISOString() });
-  } catch {
+  } catch (err) {
+    console.error("❌ Stats error:", err);
     res.status(500).json({ error: "Failed to fetch stats" });
   }
 });
 
-app.post("/bulk-add", async (req, res) => {
+app.post("/bulk-add", ensureDbConnection, async (req, res) => {
   try {
     const { numbers } = req.body;
     if (!Array.isArray(numbers)) return res.status(400).json({ error: "Numbers array required" });
@@ -180,7 +268,8 @@ app.post("/bulk-add", async (req, res) => {
       } catch (err) { results.errors.push({ number: item.number, error: err.message }); }
     }
     res.json({ success: true, results });
-  } catch {
+  } catch (err) {
+    console.error("❌ Bulk add error:", err);
     res.status(500).json({ error: "Bulk add failed" });
   }
 });
@@ -194,11 +283,31 @@ app.use((err, req, res, next) => {
 /* --------------------- Graceful shutdown ---------------------- */
 process.on("SIGINT", async () => {
   console.log("⚠️ SIGINT received, closing DB...");
-  try { await mongoose.connection.close(); } finally { process.exit(0); }
+  try { 
+    if (cachedConnection) {
+      await mongoose.connection.close(); 
+      cachedConnection = null;
+    }
+  } finally { 
+    process.exit(0); 
+  }
+});
+
+process.on("SIGTERM", async () => {
+  console.log("⚠️ SIGTERM received, closing DB...");
+  try { 
+    if (cachedConnection) {
+      await mongoose.connection.close(); 
+      cachedConnection = null;
+    }
+  } finally { 
+    process.exit(0); 
+  }
 });
 
 /* --------------- Export for Vercel / Local run ---------------- */
 module.exports = app;
+
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Local server at http://localhost:${PORT}`));
